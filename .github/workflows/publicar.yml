@@ -1,0 +1,90 @@
+# Publica una actualización de Gestion CMV o de Ajustes en su "estantería"
+# (la release con etiqueta fija gestion-cmv o ajustes), de donde los programas
+# instalados la descargan solos.
+#
+# Se activa al subir una rama "publicar-<canal>-<versión>" con la carpeta
+# publicar/ que contiene:
+#   latest.yml, <instalador>.exe.blockmap y el instalador partido en trozos
+#   <instalador>.exe.part_00, .part_01, ... (GitHub no admite archivos de >100 MB).
+# Al terminar borra esa rama, así el repositorio queda limpio.
+name: Publicar actualización
+
+on:
+  push:
+    branches:
+      - "publicar-gestion-cmv-*"
+      - "publicar-ajustes-*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publicar-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RAMA: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Comprobar archivos
+        run: |
+          set -euo pipefail
+          case "$RAMA" in
+            publicar-gestion-cmv-*) TAG=gestion-cmv; TITULO="Gestion CMV" ;;
+            publicar-ajustes-*)     TAG=ajustes;     TITULO="Ajustes" ;;
+            *) echo "Rama no válida: $RAMA"; exit 1 ;;
+          esac
+          cd publicar
+          EXE=$(grep -m1 '^path:' latest.yml | sed 's/^path: *//')
+          VERSION=$(grep -m1 '^version:' latest.yml | sed 's/^version: *//')
+          ESPERADO=$(grep -m1 '^sha512:' latest.yml | sed 's/^sha512: *//')
+          cat "$EXE".part_* > "$EXE"
+          CALC=$(openssl dgst -sha512 -binary "$EXE" | base64 -w0)
+          [ "$CALC" = "$ESPERADO" ] || { echo "El instalador no coincide con latest.yml"; exit 1; }
+          [ -f "$EXE.blockmap" ] || { echo "Falta $EXE.blockmap"; exit 1; }
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "TITULO=$TITULO" >> "$GITHUB_ENV"
+          echo "EXE=$EXE" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "OK: $TITULO $VERSION ($EXE)"
+
+      - name: Subir a la estantería
+        run: |
+          set -euo pipefail
+          cd publicar
+          NOTAS="Versión $VERSION de $TITULO. El programa la descarga e instala solo desde aquí."
+          gh release view "$TAG" -R "$REPO" >/dev/null 2>&1 || \
+            gh release create "$TAG" -R "$REPO" --title "$TITULO" --notes "$NOTAS" --latest=false
+          gh release edit "$TAG" -R "$REPO" --notes "$NOTAS"
+          # Primero el instalador y el blockmap; el latest.yml el último, para que
+          # ningún programa vea la versión nueva sin su instalador.
+          gh release upload "$TAG" -R "$REPO" --clobber "$EXE" "$EXE.blockmap"
+          gh release upload "$TAG" -R "$REPO" --clobber latest.yml
+          # Quitar los instaladores de versiones anteriores.
+          gh release view "$TAG" -R "$REPO" --json assets -q '.assets[].name' | while read -r A; do
+            case "$A" in
+              latest.yml|"$EXE"|"$EXE.blockmap") ;;
+              *.exe|*.blockmap) gh release delete-asset "$TAG" "$A" -R "$REPO" -y && echo "quitado $A" ;;
+            esac
+          done
+
+      - name: Verificar descarga
+        run: |
+          set -euo pipefail
+          sleep 10
+          BASE="https://github.com/$REPO/releases/download/$TAG"
+          curl -fsSL "$BASE/latest.yml" | grep -q "^version: $VERSION$"
+          curl -fsSL -o /tmp/inst.exe "$BASE/$EXE"
+          ESPERADO=$(grep -m1 '^sha512:' publicar/latest.yml | sed 's/^sha512: *//')
+          [ "$(openssl dgst -sha512 -binary /tmp/inst.exe | base64 -w0)" = "$ESPERADO" ]
+          echo "Publicado y verificado: $TITULO $VERSION"
+
+      - name: Borrar la rama de publicación
+        if: success()
+        run: git push origin --delete "$RAMA"
